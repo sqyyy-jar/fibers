@@ -2,7 +2,9 @@ use fibers::{Fiber, FiberStack};
 
 fn main() {
     let mut x = 21;
-    let mut fiber = Fiber::spawn(FiberStack::new(4096).expect("FiberStack"), |_main| {
+    let mut fiber = Fiber::spawn(FiberStack::new(4096).expect("FiberStack"), |main| {
+        x *= 2;
+        main.yield_to();
         x *= 2;
     });
     while fiber.is_alive() {

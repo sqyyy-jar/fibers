@@ -21,21 +21,22 @@ extern "C" {
 }
 
 #[repr(C)]
-pub struct Fiber<F> {
+pub struct Fiber<F, R> {
     /// This value must not be moved
-    inner: Box<InnerFiber<F>>,
+    inner: Box<InnerFiber<F, R>>,
 }
 
-impl<F> Fiber<F>
+impl<F, R> Fiber<F, R>
 where
-    F: FnOnce(ReturnFiber),
+    F: FnOnce(ReturnFiber) -> R,
 {
     pub fn spawn(stack: FiberStack, f: F) -> Self {
         unsafe {
-            Fiber {
+            Self {
                 inner: Box::new(InnerFiber {
                     sp: stack.base.add(stack.layout.size()),
                     ended: false,
+                    return_value: None,
                     stack,
                     f: MaybeDrop::Drop(f),
                 }),
@@ -47,37 +48,40 @@ where
         !self.inner.ended
     }
 
-    pub fn yield_to(&mut self) {
+    pub fn yield_to(&mut self) -> Option<std::thread::Result<R>> {
         self.inner.yield_to()
     }
 }
 
 #[repr(C)]
-struct InnerFiber<F> {
+struct InnerFiber<F, R> {
     /// Stack pointer of the opposite/inactive side
     sp: *mut u8,
     ended: bool,
+    return_value: Option<std::thread::Result<R>>,
     stack: FiberStack,
     f: MaybeDrop<F>,
 }
 
-impl<F> InnerFiber<F>
+impl<F, R> InnerFiber<F, R>
 where
-    F: FnOnce(ReturnFiber),
+    F: FnOnce(ReturnFiber) -> R,
 {
-    fn yield_to(&mut self) {
-        extern "C" fn exec<F>(fiber: *mut u8, f: *const u8)
+    fn yield_to(&mut self) -> Option<std::thread::Result<R>> {
+        extern "C" fn exec<F, R>(fiber: *mut u8, f: *const u8)
         where
-            F: FnOnce(ReturnFiber),
+            F: FnOnce(ReturnFiber) -> R,
         {
-            let fiber = fiber as *mut InnerFiber<F>;
-            let f = unsafe { ptr::read(f as *const F) };
-            let return_fiber = ReturnFiber::new(fiber);
-            match catch_unwind(AssertUnwindSafe(|| (f)(return_fiber))) {
-                Ok(()) => (),
-                Err(err) => eprintln!("Unhandled panic in fiber: {err:?}"),
+            unsafe {
+                let fiber = fiber as *mut InnerFiber<F, R>;
+                let f = ptr::read(f as *const F);
+                let return_fiber = ReturnFiber::new(fiber);
+                match catch_unwind(AssertUnwindSafe(|| (f)(return_fiber))) {
+                    Ok(value) => (*fiber).return_value = Some(Ok(value)),
+                    Err(err) => (*fiber).return_value = Some(Err(err)),
+                }
+                (*fiber).ended = true;
             }
-            unsafe { (*fiber).ended = true };
         }
 
         if self.ended {
@@ -85,16 +89,17 @@ where
         }
         if self.f.is_drop() {
             unsafe {
-                self.f.to_no_drop();
+                self.f.make_no_drop();
                 fiber_enter(
                     &mut self.sp,
-                    exec::<F>,
+                    exec::<F, R>,
                     self.f.as_mut() as *mut F as *mut u8,
                 );
             }
         } else {
             unsafe { fiber_yield(&mut self.sp) };
         }
+        self.return_value.take()
     }
 }
 
@@ -106,7 +111,7 @@ pub struct ReturnFiber<'a> {
 }
 
 impl<'a> ReturnFiber<'a> {
-    fn new<F>(fiber: *mut InnerFiber<F>) -> Self {
+    fn new<F, R>(fiber: *mut InnerFiber<F, R>) -> Self {
         unsafe {
             Self {
                 sp: &mut (*fiber).sp,
@@ -165,7 +170,7 @@ impl<T> MaybeDrop<T> {
         matches!(self, Self::Drop(_))
     }
 
-    fn to_no_drop(&mut self) {
+    fn make_no_drop(&mut self) {
         let Self::Drop(_) = self else {
             return;
         };
